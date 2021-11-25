@@ -1,0 +1,166 @@
+#!/usr/bin/env python
+# encoding: UTF-8
+
+import time
+import string # pylint: disable=W0402
+import socket
+import select
+import shutil
+import _thread
+import argparse
+import traceback
+
+
+# help page
+HELP="""Usage: proxy [dest [from]]
+dest  The host to redirect to (defaults to "localhost:8001")
+from  The port the proxy is listening (defaults to "8000")"""
+# maximum number of client connexions
+MAX_CLIENTS = 5
+# buffer size for sockets
+BUFFER_SIZE = 8192
+# transformation table
+TRANSFO = None
+
+
+def _build_table():
+    """Build transformation table"""
+    global TRANSFO
+    JOKER = "."
+    trans_from = ""
+    trans_to = ""
+    for c in range(256):
+        trans_from += chr(c)
+        if string.printable.find(chr(c)) >=0 :
+            trans_to += chr(c)
+        else:
+            trans_to += JOKER
+    TRANSFO = str.maketrans(trans_from, trans_to)
+
+
+def _exception_message(exception):
+    """Return an exception message"""
+    try:
+        msg = str(exception[1])
+    except Exception:
+        msg = str(exception)
+    return msg
+
+
+def _read_write(socket_from, socket_to, host_from, host_to, header, max_idling=20):
+    """Read socket_from and write to socket_to and send back response"""
+    iw = [socket_from, socket_to]
+    ow = []
+    count = 0
+    while 1:
+        count += 1
+        (ins, _, exs) = select.select(iw, ow, iw, 3)
+        if exs:
+            break
+        if ins:
+            for i in ins:
+                if i is socket_to:
+                    out = socket_from
+                else:
+                    out = socket_to
+                data = i.recv(BUFFER_SIZE)
+                if data:
+                    # add header in request data
+                    if header and i is socket_from:
+                        lines = data.split(b"\r\n")
+                        body = [lines[0], header.encode("UTF-8")]
+                        body.extend(lines[1:])
+                        data = b"\r\n".join(body)
+                    # print body on terminal
+                    body = data.decode("UTF-8")
+                    body = body.replace(host_from, host_to)
+                    if i is socket_from:
+                        _title("REQUEST")
+                    else:
+                        _title("RESPONSE")
+                    print(body.translate(TRANSFO))
+                    out.send(data)
+                    count = 0
+        else:
+            pass
+        if count == max_idling:
+            break
+
+
+def _term_width():
+    """Return terminal width"""
+    return shutil.get_terminal_size((80, 20)).columns
+
+
+def _frame(lines):
+    """Print a text in a frame"""
+    print("#"*_term_width())
+    for line in lines:
+        print(f"#{line.center(_term_width()-2)}#")
+    print("#"*_term_width())
+
+
+def _title(text):
+    """Print title"""
+    print(f"# {text} {'#'*(_term_width()-(len(text)+3))}")
+
+
+def process(socket_from, address, to_host, to_port, port, head):
+    """Process given request"""
+    socket_to = False
+    try:
+        _frame([f"Processing request from {address}",
+                f"received at {time.strftime('%Y-%m-%d %H:%M:%S')}"])
+        socket_to = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        socket_to.connect((to_host, to_port))
+        host_from = f"localhost:{port}"
+        host_to = f"{to_host}:{to_port}"
+        _read_write(socket_from, socket_to, host_from, host_to, head)
+    except Exception as exception:
+        try:
+            socket_from.close()
+            socket_to.close()
+        except Exception:
+            pass
+        print("Error: "+_exception_message(exception))
+        print(traceback.format_exc())
+
+
+def start(port, to_host, to_port, head):
+    """Start the proxy"""
+    # create, bind and start server socket
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.bind(("", port))
+    server_socket.listen(MAX_CLIENTS)
+    # loop endlessly waiting for clients
+    while True:
+        try:
+            (client_socket, address) = server_socket.accept()
+            _thread.start_new_thread(process,
+                                    (client_socket, address, to_host, to_port, port, head))
+        except KeyboardInterrupt:
+            print("Proxy interrupted on request")
+            break
+
+
+def parse_command_line():
+    """Parse command line and return port, to_host, to_port"""
+    parser = argparse.ArgumentParser(description="Proxy to print requests and responses")
+    parser.add_argument("--addr", type=str, default="127.0.0.1:8001",
+                        help="The address to redirect to (default '127.0.0.1:8001')")
+    parser.add_argument("--port", type=str, default="8000",
+                        help="The port the proxy is listening (default 8000)")
+    parser.add_argument("--head", type=str, default=None, help="Header to add in requests")
+    args = parser.parse_args()
+    to_host, to_port = args.addr.split(":")
+    return int(args.port), to_host, int(to_port), args.head
+
+
+if __name__ == "__main__":
+    # read command line arguments
+    _port, _to_host, _to_port, _head = parse_command_line()
+    print(f"Proxy listening port {_port} and redirecting to {_to_host}:{_to_port}")
+    if _head:
+        print(f"Adding header '{_head}'")
+    _build_table()
+    start(_port, _to_host, _to_port, _head)
